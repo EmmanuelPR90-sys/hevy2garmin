@@ -1300,11 +1300,13 @@ async def api_sync_single(request: Request, workout_id: str):
             reset_circuit_breaker()
 
         garmin_client = get_client(config.get("garmin_email"))
+        # Manual single-workout upload from the workouts page — bypass grace.
         sync_one_workout(
             workout,
             cfg=config,
             garmin_client=garmin_client,
             force_upload=force_upload,
+            respect_grace=False,
             database=db.get_db(),
         )
 
@@ -1674,7 +1676,8 @@ async def api_sync_one(request: Request):
         return JSONResponse({"error": "Sync already running", "busy": True})
 
     try:
-        return await _do_sync_one(request)
+        # Manual Sync Now — bypass grace so the user gets an immediate upload.
+        return await _do_sync_one(request, respect_grace=False)
     finally:
         _sync_executing.release()
 
@@ -1716,8 +1719,12 @@ def _scan_for_unsynced(hevy, is_synced, total_count, failed_ids, on_page=None):
     return unsynced, unmapped
 
 
-async def _do_sync_one(request: Request):
-    """Inner sync logic, called with _sync_executing lock held."""
+async def _do_sync_one(request: Request, *, respect_grace: bool = False):
+    """Inner sync logic, called with _sync_executing lock held.
+
+    ``respect_grace`` is True for Vercel cron (wait for watch data) and False
+    for manual Sync Now.
+    """
     from fastapi.responses import JSONResponse
 
     config = load_config()
@@ -1744,65 +1751,98 @@ async def _do_sync_one(request: Request):
             {"workouts": data.get("workouts", []), "page_count": data.get("page_count", 1)},
         )
 
-    unsynced, unmapped_found = _scan_for_unsynced(
-        hevy, db.is_synced, total_count, _failed_ids, on_page=_cache_page
-    )
-    # Update unmapped cache in DB
-    if unmapped_found:
-        _db.set_app_config("unmapped_exercises", unmapped_found)
+    # Skip ids that are already failed this session, or deferred by grace this
+    # invocation (cron continues to the next older unsynced workout).
+    skip_ids = set(_failed_ids)
+    deferred_count = 0
+    unsynced = None
+    unmapped_found: dict[str, int] = {}
+    garmin_client = None
 
-    if not unsynced:
-        return JSONResponse({"synced": 0, "remaining": 0, "done": True})
+    from hevy2garmin.sync import _workout_within_grace, sync_one_workout
 
-    # Sync this one workout
-    try:
-        from hevy2garmin.garmin import get_client
-        from hevy2garmin.merge import reset_circuit_breaker
-        from hevy2garmin.sync import sync_one_workout
-
-        if config.get("merge_mode", True):
-            reset_circuit_breaker()
-
-        garmin_client = get_client(config.get("garmin_email"))
-        sync_one_workout(
-            unsynced,
-            cfg=config,
-            garmin_client=garmin_client,
-            database=db.get_db(),
+    while True:
+        unsynced, unmapped_found = _scan_for_unsynced(
+            hevy, db.is_synced, total_count, skip_ids, on_page=_cache_page
         )
+        if unmapped_found:
+            _db.set_app_config("unmapped_exercises", unmapped_found)
 
-        remaining = hevy.get_workout_count() - db.get_synced_count()
-        return JSONResponse({"synced": 1, "title": unsynced["title"], "remaining": max(0, remaining), "done": remaining <= 0})
-    except Exception as e:
-        logger.error("Sync failed for %s: %s", unsynced.get("title", "?"), str(e)[:300])
-        err = str(e)
+        if not unsynced:
+            if deferred_count:
+                return JSONResponse({
+                    "synced": 0,
+                    "deferred": deferred_count,
+                    "remaining": remaining,
+                    "done": remaining <= 0,
+                })
+            return JSONResponse({"synced": 0, "remaining": 0, "done": True})
 
-        # Hevy API key invalid — hard stop, point to setup
-        from hevy2garmin.hevy import HevyAuthError
-        if isinstance(e, HevyAuthError):
-            return JSONResponse({"synced": 0, "error": "Hevy API key is invalid or expired. Go to Setup to enter a new key.", "remaining": -1, "done": False}, status_code=401)
+        # Defer before Garmin auth when possible (cron cold starts).
+        grace_minutes = config.get("sync", {}).get("grace_period_minutes", 120)
+        if respect_grace and _workout_within_grace(unsynced, grace_minutes):
+            sync_one_workout(unsynced, cfg=config, respect_grace=True)
+            deferred_count += 1
+            skip_ids.add(unsynced["id"])
+            continue
 
-        # Auth errors are hard stops — user needs to reconnect
-        if "Login failed" in err or "OAuth" in err or "token" in err:
-            return JSONResponse({"synced": 0, "error": "Garmin connection expired. Go to Setup to reconnect.", "remaining": -1, "done": False}, status_code=500)
+        try:
+            from hevy2garmin.garmin import get_client
+            from hevy2garmin.merge import reset_circuit_breaker
 
-        # EU consent error — hard stop with clear instructions
-        if "upload consent" in err.lower() or "EU location" in err:
-            return JSONResponse({
-                "synced": 0,
-                "error": "Garmin requires upload consent. Open connect.garmin.com/modern/settings, scroll to Data, enable Device Upload, then try again.",
-                "eu_consent": True,
-                "remaining": -1, "done": False
-            }, status_code=500)
+            if config.get("merge_mode", True):
+                reset_circuit_breaker()
 
-        # Other upload errors — skip this workout for now, don't mark as synced
-        # Track in-memory so we don't retry it in the same sync session
-        _failed_ids.add(unsynced["id"])
-        remaining = hevy.get_workout_count() - db.get_synced_count() - len(_failed_ids)
-        logger.warning("Skipping failed workout %s (will retry next session), %d remaining", unsynced["title"], remaining)
-        return JSONResponse({"synced": 0, "skipped_error": True, "title": unsynced["title"], "remaining": max(0, remaining), "done": remaining <= 0})
+            if garmin_client is None:
+                garmin_client = get_client(config.get("garmin_email"))
+            one = sync_one_workout(
+                unsynced,
+                cfg=config,
+                garmin_client=garmin_client,
+                respect_grace=False,  # already checked above
+                database=db.get_db(),
+            )
 
+            remaining = hevy.get_workout_count() - db.get_synced_count()
+            payload = {
+                "synced": 1,
+                "title": unsynced["title"],
+                "remaining": max(0, remaining),
+                "done": remaining <= 0,
+            }
+            if deferred_count:
+                payload["deferred"] = deferred_count
+            if one.no_hr:
+                payload["no_hr"] = 1
+            return JSONResponse(payload)
+        except Exception as e:
+            logger.error("Sync failed for %s: %s", unsynced.get("title", "?"), str(e)[:300])
+            err = str(e)
 
+            # Hevy API key invalid — hard stop, point to setup
+            from hevy2garmin.hevy import HevyAuthError
+            if isinstance(e, HevyAuthError):
+                return JSONResponse({"synced": 0, "error": "Hevy API key is invalid or expired. Go to Setup to enter a new key.", "remaining": -1, "done": False}, status_code=401)
+
+            # Auth errors are hard stops — user needs to reconnect
+            if "Login failed" in err or "OAuth" in err or "token" in err:
+                return JSONResponse({"synced": 0, "error": "Garmin connection expired. Go to Setup to reconnect.", "remaining": -1, "done": False}, status_code=500)
+
+            # EU consent error — hard stop with clear instructions
+            if "upload consent" in err.lower() or "EU location" in err:
+                return JSONResponse({
+                    "synced": 0,
+                    "error": "Garmin requires upload consent. Open connect.garmin.com/modern/settings, scroll to Data, enable Device Upload, then try again.",
+                    "eu_consent": True,
+                    "remaining": -1, "done": False
+                }, status_code=500)
+
+            # Other upload errors — skip this workout for now, don't mark as synced
+            # Track in-memory so we don't retry it in the same sync session
+            _failed_ids.add(unsynced["id"])
+            remaining = hevy.get_workout_count() - db.get_synced_count() - len(_failed_ids)
+            logger.warning("Skipping failed workout %s (will retry next session), %d remaining", unsynced["title"], remaining)
+            return JSONResponse({"synced": 0, "skipped_error": True, "title": unsynced["title"], "remaining": max(0, remaining), "done": remaining <= 0})
 
 
 @app.get("/api/cron/sync")
@@ -1817,8 +1857,17 @@ async def cron_sync(request: Request):
         if auth != f"Bearer {cron_secret}":
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-    # Reuse sync-one logic
-    return await api_sync_one(request)
+    if is_demo_mode():
+        return JSONResponse({"status": "demo", "message": "Sync disabled in demo mode"})
+
+    if not _acquire_sync_lock():
+        return JSONResponse({"error": "Sync already running", "busy": True})
+
+    try:
+        # Cron/autosync — respect grace so watch activities can land first.
+        return await _do_sync_one(request, respect_grace=True)
+    finally:
+        _sync_executing.release()
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:

@@ -39,7 +39,7 @@ logger = logging.getLogger("hevy2garmin")
 class SyncOneResult:
     """Outcome of syncing a single Hevy workout."""
 
-    status: str  # "synced" | "dry_run"
+    status: str  # "synced" | "dry_run" | "deferred"
     activity_id: int | None = None
     sync_method: str = "upload"
     merged: bool = False
@@ -47,6 +47,18 @@ class SyncOneResult:
     calories: int | None = None
     avg_hr: int | None = None
     no_hr: bool = False
+
+
+def _workout_within_grace(workout: dict, grace_minutes: int) -> bool:
+    """True when the workout ended less than ``grace_minutes`` ago."""
+    if grace_minutes <= 0:
+        return False
+    end_raw = workout.get("end_time") or workout.get("endTime", "")
+    end_dt = _parse_timestamp(end_raw)
+    if end_dt is None or end_dt.tzinfo is None:
+        return False
+    age_min = (datetime.now(timezone.utc) - end_dt).total_seconds() / 60.0
+    return age_min < grace_minutes
 
 
 def fetch_workouts(
@@ -106,9 +118,13 @@ def sync_one_workout(
     garmin_client=None,
     dry_run: bool = False,
     force_upload: bool = False,
+    respect_grace: bool = False,
     database: Any | None = None,
 ) -> SyncOneResult:
     """Sync one Hevy workout to Garmin (merge, FIT upload, or dry-run).
+
+    When ``respect_grace`` is True (autosync/cron), too-new workouts return
+    ``status="deferred"`` so a watch activity can land before we upload.
 
     Raises on FIT generation / upload failures so callers can map errors.
     """
@@ -116,6 +132,25 @@ def sync_one_workout(
     wid = workout.get("id", "unknown")
     title = workout.get("title", "Workout")
     start_time = workout.get("start_time") or workout.get("startTime", "")
+
+    grace_minutes = cfg.get("sync", {}).get("grace_period_minutes", 120)
+    if respect_grace and _workout_within_grace(workout, grace_minutes):
+        end_raw = workout.get("end_time") or workout.get("endTime", "")
+        end_dt = _parse_timestamp(end_raw)
+        age_min = (
+            (datetime.now(timezone.utc) - end_dt).total_seconds() / 60.0
+            if end_dt is not None
+            else 0.0
+        )
+        logger.info(
+            "  Deferring %s — ended %.0f min ago (< %d min grace); waiting for watch data",
+            wid,
+            age_min,
+            grace_minutes,
+        )
+        return SyncOneResult(status="deferred")
+
+    logger.info("Syncing: %s (%s)", title, wid)
 
     merge_mode = cfg.get("merge_mode", True)
     merge_overlap_pct = cfg.get("merge_overlap_pct", 70) / 100.0
@@ -293,7 +328,6 @@ def sync(
     garmin_password = overrides.get("garmin_password") or cfg.get("garmin_password", "")
     garmin_token_dir = cfg.get("garmin_token_dir", "~/.garminconnect")
     skip_existing = cfg.get("sync", {}).get("skip_existing", True)
-    grace_minutes = cfg.get("sync", {}).get("grace_period_minutes", 120)
 
     if not limit and not fetch_all and not since:
         limit = cfg.get("sync", {}).get("default_limit", 10)
@@ -338,26 +372,6 @@ def sync(
             stats["skipped"] += 1
             continue
 
-        # Grace period: on automatic runs, wait until the workout has had time
-        # for its Garmin watch activity to land, so we merge instead of
-        # uploading a duplicate. Manual syncs pass respect_grace=False.
-        if respect_grace and grace_minutes > 0:
-            end_raw = workout.get("end_time") or workout.get("endTime", "")
-            end_dt = _parse_timestamp(end_raw)
-            if end_dt is not None and end_dt.tzinfo is not None:
-                age_min = (datetime.now(timezone.utc) - end_dt).total_seconds() / 60.0
-                if age_min < grace_minutes:
-                    logger.info(
-                        "  Deferring %s — ended %.0f min ago (< %d min grace); waiting for watch data",
-                        wid,
-                        age_min,
-                        grace_minutes,
-                    )
-                    stats["deferred"] += 1
-                    continue
-
-        logger.info("Syncing: %s (%s)", title, wid)
-
         for ex in workout.get("exercises", []):
             ex_name = ex.get("title") or ex.get("name", "")
             cat, _, _ = lookup_exercise(ex_name, ex.get("exercise_template_id"))
@@ -370,7 +384,12 @@ def sync(
                 cfg=cfg,
                 garmin_client=garmin_client,
                 dry_run=dry_run,
+                respect_grace=respect_grace,
             )
+            if one.status == "deferred":
+                stats["deferred"] += 1
+                continue
+
             if one.status == "dry_run":
                 stats["synced"] += 1
             elif one.merged:
