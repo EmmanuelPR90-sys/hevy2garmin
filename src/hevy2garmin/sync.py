@@ -15,6 +15,7 @@ from hevy2garmin.config import load_config
 from hevy2garmin.fit import generate_fit, _parse_timestamp
 from hevy2garmin.garmin import (
     GarminUploadRejected,
+    activity_matches_start_time,
     activities_for_workout,
     delete_activity,
     find_activity_by_start_time,
@@ -60,6 +61,12 @@ def _activity_id(activity: dict) -> int | None:
         return None
 
 
+def _pending_status(pending: dict | None) -> str:
+    """Normalize durable phases to the public sync result statuses."""
+    phase = (pending or {}).get("phase")
+    return phase if phase in {"failed", "needs_review"} else "processing"
+
+
 def _terminal_payload(payload: dict, activity_id: int) -> dict:
     return {
         "garmin_activity_id": str(activity_id),
@@ -96,18 +103,22 @@ def finalize_pending(store, client, pending: dict) -> SyncOneResult:
             step = "delete" if watch_id else "commit"
             store.update_pending(wid, next_step=step, last_error=None)
         if step == "delete":
-            if int(watch_id) == activity_id:
+            if not watch_id:
+                step = "commit"
+                store.update_pending(wid, next_step=step, last_error=None)
+            elif int(watch_id) == activity_id:
                 store.update_pending(wid, phase="needs_review", last_error="replacement equals watch activity; deletion blocked")
                 return SyncOneResult(status="needs_review", activity_id=activity_id)
-            try:
-                delete_activity(client, int(watch_id))
-            except Exception as exc:
-                attempts = int(pending.get("delete_attempt_count") or 0) + 1
-                phase = "needs_review" if attempts >= 3 else "finalizing"
-                store.update_pending(wid, phase=phase, next_step="delete", delete_attempt_count=attempts, last_error=str(exc)[:1000])
-                return SyncOneResult(status="needs_review" if phase == "needs_review" else "processing", activity_id=activity_id)
-            step = "commit"
-            store.update_pending(wid, next_step=step, last_error=None)
+            else:
+                try:
+                    delete_activity(client, int(watch_id))
+                except Exception as exc:
+                    attempts = int(pending.get("delete_attempt_count") or 0) + 1
+                    phase = "needs_review" if attempts >= 3 else "finalizing"
+                    store.update_pending(wid, phase=phase, next_step="delete", delete_attempt_count=attempts, last_error=str(exc)[:1000])
+                    return SyncOneResult(status="needs_review" if phase == "needs_review" else "processing", activity_id=activity_id)
+                step = "commit"
+                store.update_pending(wid, next_step=step, last_error=None)
         _complete(store, wid, payload, activity_id)
         return SyncOneResult(status="synced", activity_id=activity_id, sync_method=payload.get("sync_method", "upload"), merge_fallback=payload.get("merge_fallback", False), calories=payload.get("calories"), avg_hr=payload.get("avg_hr"))
     except Exception as exc:
@@ -139,6 +150,20 @@ def reconcile_pending(store, client, hevy_id: str) -> SyncOneResult:
             if resolved and str(resolved) not in {str(pending.get("watch_activity_id")), *map(str, pending.get("pre_upload_ids", []))}:
                 store.update_pending(hevy_id, phase="finalizing", next_step="rename", garmin_activity_id=str(resolved), resolution_source="upload_id", last_error=None)
                 return finalize_pending(store, client, store.get_pending(hevy_id))
+    phase = pending.get("phase")
+    attempt_count = int(pending.get("attempt_count") or 0)
+    has_recovery_evidence = bool(
+        upload_id
+        or pending.get("pre_upload_ids")
+        or (phase in {"processing", "finalizing", "needs_review"} and attempt_count > 0)
+    )
+    if not has_recovery_evidence:
+        store.update_pending(
+            hevy_id,
+            phase="needs_review",
+            last_error="no upload attempt checkpoint; refusing snapshot adoption",
+        )
+        return SyncOneResult(status="needs_review")
     workout = (pending.get("payload") or {}).get("workout") or {}
     try:
         activities = activities_for_workout(client, workout)
@@ -149,8 +174,15 @@ def reconcile_pending(store, client, hevy_id: str) -> SyncOneResult:
     if pending.get("watch_activity_id"):
         excluded.add(str(pending["watch_activity_id"]))
     candidates = [a for a in activities if _activity_id(a) and str(_activity_id(a)) not in excluded]
-    # Snapshot-only recovery is deliberately strict: exactly one DEVELOPMENT strength activity.
-    safe = [a for a in candidates if str(a.get("manufacturer", "")).upper() == "DEVELOPMENT" and a.get("activityType", {}).get("typeKey", "strength_training") in {"strength_training", "other"}]
+    start_time = workout.get("start_time") or workout.get("startTime", "")
+    # Snapshot-only recovery is deliberately strict: exactly one matching
+    # DEVELOPMENT strength activity at the workout's start time.
+    safe = [
+        a for a in candidates
+        if str(a.get("manufacturer", "")).upper() == "DEVELOPMENT"
+        and (a.get("activityType") or {}).get("typeKey") in {"strength_training", "other"}
+        and activity_matches_start_time(a, start_time)
+    ]
     if len(safe) != 1:
         if candidates:
             store.update_pending(hevy_id, phase="needs_review", last_error=f"{len(candidates)} unverified snapshot candidate(s)")
@@ -244,6 +276,13 @@ def sync_one_workout(
     wid = workout.get("id", "unknown")
     title = workout.get("title", "Workout")
     start_time = workout.get("start_time") or workout.get("startTime", "")
+
+    if not dry_run:
+        pending = merge_store.get_pending(wid)
+        if isinstance(pending, dict) and pending:
+            status = _pending_status(pending)
+            logger.debug("Skipping %s (%s) — pending upload is %s", wid, title, pending.get("phase"))
+            return SyncOneResult(status=status)
 
     grace_minutes = cfg.get("sync", {}).get("grace_period_minutes", 120)
     if respect_grace and _workout_within_grace(workout, grace_minutes):
@@ -367,7 +406,7 @@ def sync_one_workout(
             claimed = merge_store.claim_pending(wid, pending_payload)
             if claimed is False:
                 pending = merge_store.get_pending(wid)
-                return SyncOneResult(status=(pending or {}).get("phase", "processing"))
+                return SyncOneResult(status=_pending_status(pending))
             try:
                 snapshot = activities_for_workout(garmin_client, workout)
                 snapshot_ids = [str(x) for a in snapshot if (x := _activity_id(a))]
@@ -514,6 +553,10 @@ def sync(
         reset_circuit_breaker()
         logger.info("Merge mode enabled — will try to enhance watch activities")
 
+    pending_by_id = {}
+    if not dry_run:
+        pending_by_id = {row["hevy_id"]: row for row in store.list_pending()}
+
     for workout in workouts:
         wid = workout.get("id", "unknown")
         title = workout.get("title", "Workout")
@@ -521,6 +564,14 @@ def sync(
         if skip_existing and store.is_synced(wid):
             logger.debug("Skipping %s (%s) — already synced", wid, title)
             stats["skipped"] += 1
+            continue
+
+        pending = pending_by_id.get(wid)
+        if pending:
+            phase = pending.get("phase")
+            bucket = _pending_status(pending)
+            logger.debug("Skipping %s (%s) — pending upload is %s", wid, title, phase)
+            stats[bucket] += 1
             continue
 
         for ex in workout.get("exercises", []):

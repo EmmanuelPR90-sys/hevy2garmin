@@ -142,19 +142,40 @@ def upload_fit(client: Garmin, fit_path: str | Path, workout_start: str | None =
 
 def activities_for_workout(client: Garmin, workout: dict) -> list[dict]:
     """Fetch all Garmin activities in the workout's conservative date window."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     start_raw = workout.get("start_time") or workout.get("startTime", "")
     end_raw = workout.get("end_time") or workout.get("endTime", "") or start_raw
     try:
-        start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+        start = parse_iso(start_raw)
+        end = parse_iso(end_raw)
     except (ValueError, TypeError):
         raise ValueError("workout has no valid time window")
     date_from = (start - timedelta(days=1)).date().isoformat()
     date_to = (end + timedelta(days=1)).date().isoformat()
     activities = _limiter.call(client.get_activities_by_date, date_from, date_to)
     return list(activities or [])
+
+
+def activity_matches_start_time(
+    activity: dict,
+    target_start: str,
+    window_minutes: int = 10,
+) -> bool:
+    """Return whether an activity starts within ``window_minutes`` of a target."""
+    try:
+        target = parse_iso(target_start)
+    except (AttributeError, ValueError, TypeError):
+        return False
+
+    target_naive = target.replace(tzinfo=None) if target.tzinfo else target
+    act_start_str = activity.get("startTimeGMT") or activity.get("startTimeLocal", "")
+    try:
+        act_start = parse_iso(act_start_str)
+        act_naive = act_start.replace(tzinfo=None) if act_start.tzinfo else act_start
+    except (AttributeError, ValueError, TypeError):
+        return False
+    return abs((act_naive - target_naive).total_seconds()) < window_minutes * 60
 
 
 def find_activity_by_start_time(
@@ -167,11 +188,11 @@ def find_activity_by_start_time(
     Searches by date range so old uploaded workouts are found regardless of
     how many newer activities exist on the account.
     """
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     try:
         target = parse_iso(target_start)
-    except (ValueError, TypeError):
+    except (AttributeError, ValueError, TypeError):
         return None
 
     # Search the workout's date ±1 day to handle timezone edge cases
@@ -190,17 +211,8 @@ def find_activity_by_start_time(
         if act_type and act_type not in ("strength_training", "other"):
             continue
 
-        # Prefer startTimeGMT (UTC) over startTimeLocal to avoid timezone mismatch
-        act_start_str = act.get("startTimeGMT") or act.get("startTimeLocal", "")
-        try:
-            if "T" not in act_start_str:
-                act_start_str = act_start_str.replace(" ", "T")
-            act_start = parse_iso(act_start_str)
-            act_naive = act_start.replace(tzinfo=None) if act_start.tzinfo else act_start
-            if abs((act_naive - target_naive).total_seconds()) < window_minutes * 60:
-                return act.get("activityId")
-        except (ValueError, TypeError):
-            continue
+        if activity_matches_start_time(act, target_start, window_minutes):
+            return act.get("activityId")
     return None
 
 
